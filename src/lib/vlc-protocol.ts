@@ -5,7 +5,7 @@
  * 1 = light ON, 0 = light OFF.
  */
 
-export const BIT_DURATION_MS = 200  // shared by emitter & receiver (~5 Hz)
+export const BIT_DURATION_MS = 500  // shared by emitter & receiver (2 Hz)
 
 export const PREAMBLE = 0b10101010
 export const START    = 0b11111111
