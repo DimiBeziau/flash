@@ -32,6 +32,17 @@ export default function ReceiverMode() {
     setListening(false)
   }, [])
 
+  const stopAndDecode = useCallback(() => {
+    const bits = runLengthDecode(samplesRef.current, threshRef.current)
+    setRawBits(bits)
+    const result = decodeBytes(bits)
+    if (result !== null) {
+      setDecoded(result)
+      celebrate()
+    }
+    stop()
+  }, [stop])
+
   const start = useCallback(async () => {
     setError(null)
     setDecoded(null)
@@ -184,7 +195,7 @@ export default function ReceiverMode() {
               Start Receiving
             </button>
           ) : (
-            <button onClick={stop} className="w-full py-4 rounded-xl font-bold text-lg bg-red-700 text-white hover:bg-red-600 transition-colors">
+            <button onClick={stopAndDecode} className="w-full py-4 rounded-xl font-bold text-lg bg-red-700 text-white hover:bg-red-600 transition-colors">
               Stop
             </button>
           )}
