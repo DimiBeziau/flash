@@ -2,9 +2,11 @@ import { useRef, useState, useCallback, useEffect } from 'react'
 import confetti from 'canvas-confetti'
 import { decodeBytes, BIT_DURATION_MS } from '../lib/vlc-protocol'
 
-const SAMPLE_RATE_MS     = 40                                    // 25 Hz
-const SAMPLES_PER_BIT    = Math.round(BIT_DURATION_MS / SAMPLE_RATE_MS) // = 5
-const WINDOW_SECONDS     = 60
+const SAMPLE_RATE_MS  = 50                                         // 20 Hz
+const SAMPLES_PER_BIT = Math.round(BIT_DURATION_MS / SAMPLE_RATE_MS) // = 10
+const WINDOW_SECONDS  = 90
+// Rolling average window for differential detection (~1 bit period of history)
+const AVG_WINDOW      = SAMPLES_PER_BIT
 
 export default function ReceiverMode() {
   const videoRef    = useRef<HTMLVideoElement>(null)
@@ -12,18 +14,17 @@ export default function ReceiverMode() {
   const streamRef   = useRef<MediaStream | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const samplesRef  = useRef<number[]>([])
-  const luxHistRef  = useRef<number[]>([])  // last 30 lux values for sparkline
 
-  const [listening, setListening]   = useState(false)
-  const [lux, setLux]               = useState(0)
-  const [threshold, setThreshold]   = useState(128)
-  const [rawBits, setRawBits]       = useState<boolean[]>([])
-  const [decoded, setDecoded]       = useState<string | null>(null)
-  const [error, setError]           = useState<string | null>(null)
-  const [elapsed, setElapsed]       = useState(0)
-  const [luxHist, setLuxHist]       = useState<number[]>([])
+  const [listening, setListening]     = useState(false)
+  const [lux, setLux]                 = useState(0)
+  const [luxHist, setLuxHist]         = useState<number[]>([])
+  const [rawBits, setRawBits]         = useState<boolean[]>([])
+  const [decoded, setDecoded]         = useState<string | null>(null)
+  const [error, setError]             = useState<string | null>(null)
+  const [elapsed, setElapsed]         = useState(0)
   const [transitions, setTransitions] = useState(0)
-  const startTimeRef                = useRef(0)
+  const startTimeRef                  = useRef(0)
+  const luxHistRef                    = useRef<number[]>([])
 
   const stop = useCallback(() => {
     if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null }
@@ -31,17 +32,17 @@ export default function ReceiverMode() {
     setListening(false)
   }, [])
 
-  const tryDecode = useCallback((samples: number[], thresh: number): string | null => {
-    const bits = rldDecode(samples, thresh, SAMPLES_PER_BIT)
-    setRawBits(bits)
+  const tryDecode = useCallback((samples: number[]): string | null => {
+    const bits = rldDecode(samples, SAMPLES_PER_BIT)
+    if (bits.length > 0) setRawBits(bits)
     return decodeBytes(bits)
   }, [])
 
   const stopAndDecode = useCallback(() => {
-    const result = tryDecode(samplesRef.current, threshold)
+    const result = tryDecode(samplesRef.current)
     if (result !== null) { setDecoded(result); celebrate() }
     stop()
-  }, [stop, tryDecode, threshold])
+  }, [stop, tryDecode])
 
   const start = useCallback(async () => {
     setError(null)
@@ -49,6 +50,7 @@ export default function ReceiverMode() {
     setRawBits([])
     setElapsed(0)
     setTransitions(0)
+    setLuxHist([])
     samplesRef.current  = []
     luxHistRef.current  = []
 
@@ -58,7 +60,10 @@ export default function ReceiverMode() {
         audio: false,
       })
       streamRef.current = stream
-      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play() }
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        await videoRef.current.play()
+      }
 
       setListening(true)
       startTimeRef.current = Date.now()
@@ -69,16 +74,16 @@ export default function ReceiverMode() {
 
         setLux(lum)
 
-        // Sparkline history
-        luxHistRef.current = [...luxHistRef.current.slice(-29), lum]
+        // Sparkline
+        luxHistRef.current = [...luxHistRef.current.slice(-39), lum]
         setLuxHist([...luxHistRef.current])
 
-        // Count luminosity transitions (edge detection)
+        // Count transitions (for debug feedback)
         const prev = samplesRef.current[samplesRef.current.length - 1]
         if (prev !== undefined) {
-          const wasHi = prev > threshold
-          const isHi  = lum  > threshold
-          if (wasHi !== isHi) setTransitions(t => t + 1)
+          const prevBit = isHighRelative(samplesRef.current, prev)
+          const curBit  = isHighRelative(samplesRef.current, lum)
+          if (prevBit !== curBit) setTransitions(t => t + 1)
         }
 
         samplesRef.current.push(lum)
@@ -86,9 +91,9 @@ export default function ReceiverMode() {
         const secs = (Date.now() - startTimeRef.current) / 1000
         setElapsed(Math.floor(secs))
 
-        // Attempt decode every 5 new samples (~200ms)
-        if (samplesRef.current.length % 5 === 0) {
-          const result = tryDecode(samplesRef.current, threshold)
+        // Try decode every half bit period
+        if (samplesRef.current.length % Math.ceil(SAMPLES_PER_BIT / 2) === 0) {
+          const result = tryDecode(samplesRef.current)
           if (result !== null) {
             setDecoded(result)
             stop()
@@ -102,13 +107,14 @@ export default function ReceiverMode() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }, [stop, tryDecode, threshold])
+  }, [stop, tryDecode])
 
   useEffect(() => () => stop(), [stop])
 
-  const luxPct = Math.round((lux / 255) * 100)
-  const isHi   = lux > threshold
-  const displayBits = rawBits.slice(-80)
+  // Compute rolling avg for display
+  const recent = samplesRef.current.slice(-AVG_WINDOW)
+  const avg = recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : lux
+  const isHi = lux > avg * 1.08
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col">
@@ -120,7 +126,7 @@ export default function ReceiverMode() {
       {/* Video */}
       <div className="flex justify-center px-6 mb-4">
         <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black w-full max-w-sm aspect-video">
-          <video ref={videoRef} className="w-full h-full object-cover opacity-70" muted playsInline />
+          <video ref={videoRef} className="w-full h-full object-cover opacity-80" muted playsInline />
           {listening && (
             <div className="absolute inset-0 pointer-events-none">
               <div className="absolute left-0 right-0 h-0.5 bg-indigo-500/60 animate-scan" />
@@ -135,7 +141,7 @@ export default function ReceiverMode() {
           )}
           {!listening && (
             <div className="absolute inset-0 flex items-center justify-center">
-              <span className="text-slate-500 text-sm font-mono">Camera off</span>
+              <span className="text-slate-500 text-sm font-mono">Caméra off</span>
             </div>
           )}
         </div>
@@ -144,59 +150,49 @@ export default function ReceiverMode() {
 
       <div className="flex-1 flex flex-col items-center px-6 gap-4">
 
-        {/* Lux meter + sparkline */}
+        {/* Live lux indicator */}
         {listening && (
           <div className="w-full max-w-sm space-y-2">
             <div className="flex justify-between text-xs font-mono text-slate-400">
-              <span>Luminosité</span>
+              <span>Luminosité (différentielle)</span>
               <span className={isHi ? 'text-white font-bold' : 'text-slate-500'}>
-                {Math.round(lux)}/255 {isHi ? '● HI' : '○ lo'}
+                {Math.round(lux)}/255 · moy {Math.round(avg)} · {isHi ? '● HI' : '○ lo'}
               </span>
             </div>
-            <div className="h-3 bg-slate-800 rounded-full overflow-hidden">
-              <div
-                className={`h-full rounded-full transition-all duration-75 ${isHi ? 'bg-white' : 'bg-indigo-600'}`}
-                style={{ width: `${luxPct}%` }}
-              />
+
+            {/* Sparkline — bars turn white when above rolling avg */}
+            <div className="flex items-end gap-px h-10 bg-slate-900 rounded-lg px-1 py-1">
+              {luxHist.map((v, i) => {
+                const localSlice = luxHist.slice(Math.max(0, i - AVG_WINDOW), i)
+                const localAvg = localSlice.length
+                  ? localSlice.reduce((a, b) => a + b, 0) / localSlice.length
+                  : v
+                const hi = v > localAvg * 1.08
+                return (
+                  <div
+                    key={i}
+                    className={`flex-1 rounded-sm ${hi ? 'bg-white' : 'bg-indigo-800'}`}
+                    style={{ height: `${Math.max(4, Math.round((v / 255) * 100))}%` }}
+                  />
+                )
+              })}
             </div>
 
-            {/* Sparkline */}
-            <div className="flex items-end gap-px h-8 bg-slate-900 rounded-lg px-1">
-              {luxHist.map((v, i) => (
-                <div
-                  key={i}
-                  className={`flex-1 rounded-sm transition-all duration-75 ${v > threshold ? 'bg-white' : 'bg-indigo-800'}`}
-                  style={{ height: `${Math.round((v / 255) * 100)}%` }}
-                />
-              ))}
-            </div>
-
-            {/* Threshold slider */}
-            <div className="space-y-1">
-              <div className="flex justify-between text-xs font-mono text-slate-500">
-                <span>Seuil</span>
-                <span>{threshold}/255</span>
-              </div>
-              <input
-                type="range" min={10} max={245} value={threshold}
-                onChange={e => setThreshold(Number(e.target.value))}
-                className="w-full accent-indigo-500"
-              />
-              <p className="text-slate-600 text-xs font-mono">
-                Ajuste si les barres du graphe ne passent pas au blanc lors des flashs
-              </p>
-            </div>
+            <p className="text-slate-600 text-xs font-mono">
+              Les barres doivent alterner blanc/sombre lors des flashs de l'émetteur.
+              {transitions < 5 && elapsed > 3 ? ' ⚠ Peu de transitions — approche les écrans.' : ''}
+            </p>
           </div>
         )}
 
-        {/* Bit stream */}
+        {/* Bit stream visualizer */}
         {rawBits.length > 0 && (
           <div className="w-full max-w-sm">
             <p className="text-slate-500 text-xs font-mono mb-1">
-              {rawBits.length} bits reconstruits ({samplesRef.current.length} samples)
+              {rawBits.length} bits reconstruits
             </p>
             <div className="flex flex-wrap gap-0.5">
-              {displayBits.map((b, i) => (
+              {rawBits.slice(-80).map((b, i) => (
                 <span key={i} className={`w-2.5 h-2.5 rounded-sm ${b ? 'bg-white' : 'bg-slate-700'}`} />
               ))}
             </div>
@@ -214,22 +210,28 @@ export default function ReceiverMode() {
         {error && <p className="text-red-400 text-xs font-mono text-center max-w-sm">⚠ {error}</p>}
 
         {/* Buttons */}
-        <div className="w-full max-w-sm">
+        <div className="w-full max-w-sm space-y-2">
           {!listening ? (
             <button onClick={start} className="w-full py-4 rounded-xl font-bold text-lg bg-indigo-600 text-white hover:bg-indigo-500 transition-colors">
               Start Receiving
             </button>
           ) : (
             <button onClick={stopAndDecode} className="w-full py-4 rounded-xl font-bold text-lg bg-red-700 text-white hover:bg-red-600 transition-colors">
-              Stop &amp; Decode
+              Stop &amp; Décoder
             </button>
           )}
         </div>
 
+        {/* Step-by-step */}
         {!listening && !decoded && (
-          <p className="text-slate-600 text-xs font-mono text-center max-w-xs">
-            Pointe la caméra vers l'émetteur. Le compteur "transitions" doit monter pendant la transmission.
-          </p>
+          <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-2">
+            <p className="text-slate-400 text-xs font-mono uppercase tracking-widest mb-3">Mode opératoire</p>
+            <Step n={1} text="Lance le Récepteur ici en premier" />
+            <Step n={2} text="Sur l'autre appareil, ouvre l'Emetteur et tape un message court (ex: VLC)" />
+            <Step n={3} text="Approche les deux écrans face à face, à moins de 15 cm" />
+            <Step n={4} text="L'émetteur clignote — tu dois voir les barres du graphe alterner" />
+            <Step n={5} text="Le message apparaît automatiquement, ou appuie sur Stop & Décoder" />
+          </div>
         )}
       </div>
     </div>
@@ -237,14 +239,25 @@ export default function ReceiverMode() {
 }
 
 /**
- * Run-length decode using a KNOWN samples-per-bit ratio
- * instead of estimating from data (much more reliable).
- * Applies a median filter first to kill single-sample noise.
+ * Differential bit detection: a sample is HIGH if it's 8%+ above
+ * the rolling average of the last AVG_WINDOW samples.
+ * This cancels out slow auto-exposure drift.
  */
-function rldDecode(samples: number[], threshold: number, samplesPerBit: number): boolean[] {
+function isHighRelative(history: number[], current: number): boolean {
+  if (history.length < 3) return false
+  const window = history.slice(-AVG_WINDOW)
+  const avg = window.reduce((a, b) => a + b, 0) / window.length
+  return current > avg * 1.08
+}
+
+/**
+ * Run-length decode using a fixed known samples-per-bit ratio.
+ * Median filter applied first to kill single-sample noise spikes.
+ */
+function rldDecode(samples: number[], samplesPerBit: number): boolean[] {
   if (samples.length < samplesPerBit * 4) return []
 
-  // Median filter (window = MEDIAN_WINDOW)
+  // Median filter (window=3)
   const filtered = samples.map((_, i) => {
     const w = [
       samples[Math.max(0, i - 1)],
@@ -254,8 +267,13 @@ function rldDecode(samples: number[], threshold: number, samplesPerBit: number):
     return w[1]
   })
 
-  // Binarize
-  const binary = filtered.map(s => s > threshold)
+  // Differential binarization: HIGH = 8% above rolling avg
+  const binary: boolean[] = []
+  for (let i = 0; i < filtered.length; i++) {
+    const window = filtered.slice(Math.max(0, i - AVG_WINDOW), i)
+    const avg = window.length ? window.reduce((a, b) => a + b, 0) / window.length : filtered[i]
+    binary.push(filtered[i] > avg * 1.08)
+  }
 
   // Build runs
   const runs: { v: boolean; n: number }[] = []
@@ -266,7 +284,7 @@ function rldDecode(samples: number[], threshold: number, samplesPerBit: number):
   }
   runs.push({ v: cur, n: count })
 
-  // Reconstruct bits using fixed known ratio
+  // Reconstruct bits
   const bits: boolean[] = []
   for (const run of runs) {
     const nBits = Math.max(1, Math.round(run.n / samplesPerBit))
@@ -293,4 +311,15 @@ function sampleFrame(video: HTMLVideoElement | null, canvas: HTMLCanvasElement |
 
 function celebrate() {
   confetti({ particleCount: 160, spread: 90, origin: { y: 0.6 }, colors: ['#6366f1', '#a5b4fc', '#818cf8', '#ffffff', '#fbbf24'] })
+}
+
+function Step({ n, text }: { n: number; text: string }) {
+  return (
+    <div className="flex gap-3 items-start">
+      <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-400 text-xs font-bold flex items-center justify-center flex-shrink-0 mt-0.5">
+        {n}
+      </span>
+      <p className="text-slate-400 text-xs">{text}</p>
+    </div>
+  )
 }
