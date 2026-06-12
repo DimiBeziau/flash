@@ -2,42 +2,43 @@ import { useRef, useState, useCallback, useEffect } from 'react'
 import confetti from 'canvas-confetti'
 import { decodeBytes } from '../lib/vlc-protocol'
 
-const SAMPLE_RATE_MS  = 60   // ~16 samples/sec
-const THRESHOLD       = 140  // luminosity 0-255 above = "light ON"
-const WINDOW_SECONDS  = 30   // max capture window
+const SAMPLE_RATE_MS = 30    // 33Hz — oversampling intentional, run-length decoder handles it
+const WINDOW_SECONDS = 45
 
 export default function ReceiverMode() {
-  const videoRef        = useRef<HTMLVideoElement>(null)
-  const canvasRef       = useRef<HTMLCanvasElement>(null)
-  const streamRef       = useRef<MediaStream | null>(null)
-  const intervalRef     = useRef<ReturnType<typeof setInterval> | null>(null)
-  const bitsRef         = useRef<boolean[]>([])
+  const videoRef    = useRef<HTMLVideoElement>(null)
+  const canvasRef   = useRef<HTMLCanvasElement>(null)
+  const streamRef   = useRef<MediaStream | null>(null)
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Raw luminosity samples (not bits — run-length decoded later)
+  const samplesRef  = useRef<number[]>([])
+  // Adaptive threshold: set from observed min/max in first 1s
+  const threshRef   = useRef<number>(140)
+  const calibRef    = useRef<{ min: number; max: number; count: number }>({ min: 255, max: 0, count: 0 })
 
   const [listening, setListening] = useState(false)
   const [lux, setLux]             = useState(0)
-  const [bits, setBits]           = useState<boolean[]>([])
+  const [threshold, setThreshold] = useState(140)
+  const [rawBits, setRawBits]     = useState<boolean[]>([])
   const [decoded, setDecoded]     = useState<string | null>(null)
   const [error, setError]         = useState<string | null>(null)
   const [elapsed, setElapsed]     = useState(0)
   const startTimeRef              = useRef(0)
 
   const stop = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current)
-      intervalRef.current = null
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
+    if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null }
+    if (streamRef.current)   { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
     setListening(false)
   }, [])
 
   const start = useCallback(async () => {
     setError(null)
     setDecoded(null)
-    bitsRef.current = []
-    setBits([])
+    samplesRef.current  = []
+    calibRef.current    = { min: 255, max: 0, count: 0 }
+    threshRef.current   = 140
+    setRawBits([])
     setElapsed(0)
 
     try {
@@ -46,36 +47,45 @@ export default function ReceiverMode() {
         audio: false,
       })
       streamRef.current = stream
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        await videoRef.current.play()
-      }
+      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play() }
 
       setListening(true)
       startTimeRef.current = Date.now()
 
       intervalRef.current = setInterval(() => {
-        const ctx = sampleLuminosity()
-        if (ctx === null) return
+        const lum = sampleFrame(videoRef.current, canvasRef.current)
+        if (lum === null) return
 
-        const { lum } = ctx
         setLux(lum)
+        const now = Date.now()
+        const secs = (now - startTimeRef.current) / 1000
+        setElapsed(Math.floor(secs))
 
-        const bit = lum > THRESHOLD
-        bitsRef.current.push(bit)
-        setBits([...bitsRef.current])
+        // ── Calibration: first 800ms, measure dynamic range ──────────────
+        const calib = calibRef.current
+        if (calib.count < 27) { // ~800ms at 30ms intervals
+          calib.min = Math.min(calib.min, lum)
+          calib.max = Math.max(calib.max, lum)
+          calib.count++
+          if (calib.count === 27 && calib.max - calib.min > 20) {
+            threshRef.current = calib.min + (calib.max - calib.min) * 0.5
+            setThreshold(Math.round(threshRef.current))
+          }
+          return // don't accumulate during calibration
+        }
 
-        const secs = Math.floor((Date.now() - startTimeRef.current) / 1000)
-        setElapsed(secs)
+        samplesRef.current.push(lum)
 
-        // Attempt decode every 8 new bits
-        if (bitsRef.current.length % 8 === 0) {
-          const result = decodeBytes(bitsRef.current)
+        // ── Decode attempt every ~300ms (10 new samples) ─────────────────
+        if (samplesRef.current.length % 10 === 0) {
+          const bits = runLengthDecode(samplesRef.current, threshRef.current)
+          setRawBits(bits)
+          const result = decodeBytes(bits)
           if (result !== null) {
             setDecoded(result)
             stop()
             celebrate()
+            return
           }
         }
 
@@ -86,59 +96,30 @@ export default function ReceiverMode() {
     }
   }, [stop])
 
-  const sampleLuminosity = (): { lum: number } | null => {
-    const video  = videoRef.current
-    const canvas = canvasRef.current
-    if (!video || !canvas || video.readyState < 2) return null
-
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return null
-
-    const W = 64, H = 64
-    canvas.width  = W
-    canvas.height = H
-    ctx.drawImage(video, 0, 0, W, H)
-
-    const data = ctx.getImageData(0, 0, W, H).data
-    let sum = 0
-    for (let i = 0; i < data.length; i += 4) {
-      // Perceived luminosity
-      sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
-    }
-    return { lum: sum / (W * H) }
-  }
-
   useEffect(() => () => stop(), [stop])
 
-  const luxPercent = Math.round((lux / 255) * 100)
-  const bitHistory = bits.slice(-80)
+  const luxPct = Math.round((lux / 255) * 100)
+  const isHi   = lux > threshRef.current
+  const displayBits = rawBits.slice(-80)
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col">
-      {/* Header */}
       <div className="p-6 pt-10 flex flex-col items-center gap-2">
-        <span className="text-xs font-mono tracking-widest text-indigo-400 uppercase">
-          Camera Analysis
-        </span>
+        <span className="text-xs font-mono tracking-widest text-indigo-400 uppercase">Camera Analysis</span>
         <h1 className="text-3xl font-bold text-white tracking-tight">Receiver</h1>
       </div>
 
-      {/* Video preview (hidden canvas for sampling) */}
       <div className="flex justify-center px-6 mb-4">
         <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black w-full max-w-sm aspect-video">
-          <video
-            ref={videoRef}
-            className="w-full h-full object-cover opacity-70"
-            muted
-            playsInline
-          />
+          <video ref={videoRef} className="w-full h-full object-cover opacity-70" muted playsInline />
           {listening && (
             <div className="absolute inset-0 pointer-events-none">
-              {/* Scan line effect */}
               <div className="absolute left-0 right-0 h-0.5 bg-indigo-500/60 animate-scan" />
               <div className="absolute top-2 left-2 flex items-center gap-1">
                 <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                <span className="text-white text-xs font-mono">REC</span>
+                <span className="text-white text-xs font-mono">
+                  {samplesRef.current.length < 1 ? 'CALIBRATING…' : 'REC'}
+                </span>
               </div>
               <div className="absolute bottom-2 right-2 text-indigo-300 text-xs font-mono">
                 {elapsed}s / {WINDOW_SECONDS}s
@@ -155,74 +136,55 @@ export default function ReceiverMode() {
       </div>
 
       <div className="flex-1 flex flex-col items-center px-6 gap-5">
-        {/* Lux meter */}
         {listening && (
           <div className="w-full max-w-sm">
             <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
               <span>Luminosity</span>
-              <span className={lux > THRESHOLD ? 'text-white font-bold' : 'text-slate-500'}>
-                {luxPercent}% {lux > THRESHOLD ? '● HI' : '○ lo'}
+              <span className={isHi ? 'text-white font-bold' : 'text-slate-500'}>
+                {luxPct}% {isHi ? '● HI' : '○ lo'}
               </span>
             </div>
             <div className="h-3 bg-slate-800 rounded-full overflow-hidden">
               <div
-                className={`h-full rounded-full transition-all duration-75 ${
-                  lux > THRESHOLD ? 'bg-white' : 'bg-indigo-600'
-                }`}
-                style={{ width: `${luxPercent}%` }}
+                className={`h-full rounded-full transition-all duration-75 ${isHi ? 'bg-white' : 'bg-indigo-600'}`}
+                style={{ width: `${luxPct}%` }}
               />
             </div>
             <div className="mt-1 text-xs font-mono text-slate-600">
-              threshold: {THRESHOLD}/255
+              seuil auto: {threshold}/255
             </div>
           </div>
         )}
 
-        {/* Bit stream visualizer */}
-        {bits.length > 0 && (
+        {rawBits.length > 0 && (
           <div className="w-full max-w-sm">
             <p className="text-slate-500 text-xs font-mono mb-1">
-              Bit stream ({bits.length} bits captured)
+              {rawBits.length} bits décodés (run-length)
             </p>
             <div className="flex flex-wrap gap-0.5">
-              {bitHistory.map((b, i) => (
-                <span
-                  key={i}
-                  className={`w-2.5 h-2.5 rounded-sm ${b ? 'bg-white' : 'bg-slate-700'}`}
-                />
+              {displayBits.map((b, i) => (
+                <span key={i} className={`w-2.5 h-2.5 rounded-sm ${b ? 'bg-white' : 'bg-slate-700'}`} />
               ))}
             </div>
           </div>
         )}
 
-        {/* Decoded message */}
         {decoded !== null && (
           <div className="w-full max-w-sm bg-green-950 border border-green-700 rounded-2xl p-5">
-            <p className="text-green-400 text-xs font-mono mb-2 tracking-widest uppercase">
-              ✓ Message Received
-            </p>
+            <p className="text-green-400 text-xs font-mono mb-2 tracking-widest uppercase">✓ Message reçu</p>
             <p className="text-white text-xl font-bold break-words">{decoded}</p>
           </div>
         )}
 
-        {error && (
-          <p className="text-red-400 text-xs font-mono text-center max-w-sm">⚠ {error}</p>
-        )}
+        {error && <p className="text-red-400 text-xs font-mono text-center max-w-sm">⚠ {error}</p>}
 
-        {/* CTA */}
         <div className="w-full max-w-sm">
           {!listening ? (
-            <button
-              onClick={start}
-              className="w-full py-4 rounded-xl font-bold text-lg bg-indigo-600 text-white hover:bg-indigo-500 transition-colors"
-            >
+            <button onClick={start} className="w-full py-4 rounded-xl font-bold text-lg bg-indigo-600 text-white hover:bg-indigo-500 transition-colors">
               Start Receiving
             </button>
           ) : (
-            <button
-              onClick={stop}
-              className="w-full py-4 rounded-xl font-bold text-lg bg-red-700 text-white hover:bg-red-600 transition-colors"
-            >
+            <button onClick={stop} className="w-full py-4 rounded-xl font-bold text-lg bg-red-700 text-white hover:bg-red-600 transition-colors">
               Stop
             </button>
           )}
@@ -230,12 +192,51 @@ export default function ReceiverMode() {
 
         {!listening && !decoded && (
           <p className="text-slate-600 text-xs font-mono text-center max-w-xs">
-            Point camera at the emitter's flashlight or screen, then tap Start.
+            Pointe la caméra vers la lampe ou l'écran de l'émetteur, puis appuie sur Start.
           </p>
         )}
       </div>
     </div>
   )
+}
+
+/**
+ * Convert raw luminosity samples into bits via run-length decoding.
+ *
+ * Each "run" of consecutive above/below-threshold samples gets compressed
+ * into N bits where N = round(run_length / estimated_min_run).
+ * This compensates for oversampling (multiple samples per bit period).
+ */
+function runLengthDecode(samples: number[], threshold: number): boolean[] {
+  if (samples.length < 8) return []
+
+  // Binarize
+  const binary = samples.map(s => s > threshold)
+
+  // Build runs
+  const runs: { v: boolean; n: number }[] = []
+  let cur = binary[0], count = 1
+  for (let i = 1; i < binary.length; i++) {
+    if (binary[i] === cur) { count++ }
+    else { runs.push({ v: cur, n: count }); cur = binary[i]; count = 1 }
+  }
+  runs.push({ v: cur, n: count })
+
+  if (runs.length < 2) return []
+
+  // Estimate 1-bit period = 10th percentile of run lengths
+  const sorted = runs.map(r => r.n).sort((a, b) => a - b)
+  const p10idx  = Math.max(0, Math.floor(sorted.length * 0.1))
+  const minRun  = Math.max(1, sorted[p10idx])
+
+  // Reconstruct bits
+  const bits: boolean[] = []
+  for (const run of runs) {
+    const nBits = Math.max(1, Math.round(run.n / minRun))
+    for (let i = 0; i < nBits; i++) bits.push(run.v)
+  }
+
+  return bits
 }
 
 function celebrate() {
@@ -245,4 +246,19 @@ function celebrate() {
     origin: { y: 0.6 },
     colors: ['#6366f1', '#a5b4fc', '#818cf8', '#ffffff', '#fbbf24'],
   })
+}
+
+function sampleFrame(video: HTMLVideoElement | null, canvas: HTMLCanvasElement | null): number | null {
+  if (!video || !canvas || video.readyState < 2) return null
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  const W = 64, H = 64
+  canvas.width = W; canvas.height = H
+  ctx.drawImage(video, 0, 0, W, H)
+  const data = ctx.getImageData(0, 0, W, H).data
+  let sum = 0
+  for (let i = 0; i < data.length; i += 4) {
+    sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+  }
+  return sum / (W * H)
 }
