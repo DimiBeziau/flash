@@ -3,7 +3,7 @@ import { encodeMessage, frameBitCount, BIT_DURATION_MS, MAX_MESSAGE_BYTES } from
 import { useTorch } from '../hooks/useTorch'
 
 export default function EmitterMode() {
-  const [message, setMessage] = useState('VLC')
+  const [message, setMessage] = useState('flash')
   const [sending, setSending] = useState(false)
   const [progress, setProgress] = useState(0)
   const [screenOn, setScreenOn] = useState(false)
