@@ -70,9 +70,12 @@ function stuffBits(bits: boolean[]): boolean[] {
     out.push(bit)
 
     if (run === 3) {
-      out.push(!bit)   // stuffed bit
-      run = 0
-      last = null
+      const stuffed: boolean = !bit
+      out.push(stuffed)
+      // stuffed bit itself starts a new run of 1 — NOT reset to 0
+      // otherwise the stuffed bit + following same-value bits could form a run > 3
+      run = 1
+      last = stuffed
     }
   }
   return out
@@ -86,14 +89,20 @@ function destuffBits(bits: boolean[]): boolean[] {
   let skipNext = false
 
   for (const bit of bits) {
-    if (skipNext) { skipNext = false; run = 0; last = null; continue }
+    if (skipNext) {
+      skipNext = false
+      // The stuffed bit starts a new run of 1 on its own value
+      run = 1
+      last = bit
+      continue
+    }
 
     if (bit === last) run++
     else { run = 1; last = bit }
 
     out.push(bit)
 
-    if (run === 3) { skipNext = true; run = 0; last = null }
+    if (run === 3) { skipNext = true }
   }
   return out
 }
