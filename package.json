@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:proto": "esbuild src/lib/vlc-protocol.ts --bundle --format=esm --outfile=scripts/.build/vlc-protocol.mjs && node scripts/test-protocol.mjs"
   },
   "dependencies": {
     "canvas-confetti": "^1.9.3",

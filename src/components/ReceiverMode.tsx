@@ -1,11 +1,15 @@
 import { useRef, useState, useCallback, useEffect } from 'react'
 import confetti from 'canvas-confetti'
-import { decodeBytes, BIT_DURATION_MS } from '../lib/vlc-protocol'
+import {
+  decodeSamples,
+  calibrateThreshold,
+  samplesToStates,
+  type Sample,
+} from '../lib/vlc-protocol'
 
-const SAMPLE_RATE_MS  = 40
-const SAMPLES_PER_BIT = Math.round(BIT_DURATION_MS / SAMPLE_RATE_MS)  // 12
-const WINDOW_SECONDS  = 90
-const CALIB_SAMPLES   = Math.round(1500 / SAMPLE_RATE_MS)             // 1.5s
+const CALIB_MS      = 1500
+const WINDOW_MS     = 120_000
+const DECODE_EVERY  = 400     // ms between decode attempts
 
 type Phase = 'idle' | 'calibrating' | 'listening' | 'done'
 
@@ -13,60 +17,60 @@ export default function ReceiverMode() {
   const videoRef    = useRef<HTMLVideoElement>(null)
   const canvasRef   = useRef<HTMLCanvasElement>(null)
   const streamRef   = useRef<MediaStream | null>(null)
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const samplesRef  = useRef<number[]>([])
-  const calibRef    = useRef<number[]>([])
-  // Noise level (std-dev of deltas during calibration) — used as delta threshold base
-  const noiseLevelRef = useRef<number>(5)
+  const rafRef      = useRef<number>(0)
+  const runningRef  = useRef(false)
 
-  const [phase, setPhase]             = useState<Phase>('idle')
-  const [lux, setLux]                 = useState(0)
-  const [deltaThresh, setDeltaThresh] = useState(15)
-  const [luxHist, setLuxHist]         = useState<number[]>([])
-  const [stateHist, setStateHist]     = useState<boolean[]>([])
-  const [rawBits, setRawBits]         = useState<boolean[]>([])
-  const [decoded, setDecoded]         = useState<string | null>(null)
-  const [error, setError]             = useState<string | null>(null)
-  const [elapsed, setElapsed]         = useState(0)
-  const [transitions, setTransitions] = useState(0)
-  const [calibPct, setCalibPct]       = useState(0)
-  const startTimeRef                  = useRef(0)
-  const luxHistRef                    = useRef<number[]>([])
-  const stateHistRef                  = useRef<boolean[]>([])
+  const calibSamplesRef = useRef<Sample[]>([])
+  const samplesRef      = useRef<Sample[]>([])
+  const thresholdRef    = useRef(12)
+  const t0Ref           = useRef(0)
+  const lastDecodeRef   = useRef(0)
+  const phaseRef        = useRef<Phase>('idle')
+
+  const [phase, setPhase]         = useState<Phase>('idle')
+  const [lux, setLux]             = useState(0)
+  const [stateHist, setStateHist] = useState<boolean[]>([])
+  const [decoded, setDecoded]     = useState<string | null>(null)
+  const [error, setError]         = useState<string | null>(null)
+  const [elapsed, setElapsed]     = useState(0)
+  const [edges, setEdges]         = useState(0)
+  const [calibPct, setCalibPct]   = useState(0)
+
+  const setPhaseBoth = (p: Phase) => { phaseRef.current = p; setPhase(p) }
 
   const hardStop = useCallback(() => {
-    if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null }
-    if (streamRef.current)   { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
+    runningRef.current = false
+    cancelAnimationFrame(rafRef.current)
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
   }, [])
 
-  const tryDecode = useCallback((samples: number[], noiseLevel: number): string | null => {
-    const { bits, states } = deltaRLD(samples, noiseLevel, SAMPLES_PER_BIT)
-    if (bits.length > 0) setRawBits(bits)
-    if (states.length > 0) setStateHist([...states])
-    return bits.length > 0 ? decodeBytes(bits) : null
-  }, [])
+  const finish = useCallback((result: string | null) => {
+    hardStop()
+    setPhaseBoth('done')
+    if (result !== null) {
+      setDecoded(result)
+      celebrate()
+    }
+  }, [hardStop])
 
   const stopAndDecode = useCallback(() => {
-    const result = tryDecode(samplesRef.current, noiseLevelRef.current)
-    if (result !== null) { setDecoded(result); celebrate() }
-    hardStop()
-    setPhase('done')
-  }, [hardStop, tryDecode])
+    finish(decodeSamples(samplesRef.current, thresholdRef.current))
+  }, [finish])
 
   const start = useCallback(async () => {
     setError(null)
     setDecoded(null)
-    setRawBits([])
-    setElapsed(0)
-    setTransitions(0)
-    setLuxHist([])
     setStateHist([])
+    setElapsed(0)
+    setEdges(0)
     setCalibPct(0)
-    samplesRef.current   = []
-    calibRef.current     = []
-    noiseLevelRef.current = 5
-    luxHistRef.current   = []
-    stateHistRef.current = []
+    calibSamplesRef.current = []
+    samplesRef.current = []
+    thresholdRef.current = 12
+    lastDecodeRef.current = 0
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -74,76 +78,70 @@ export default function ReceiverMode() {
         audio: false,
       })
       streamRef.current = stream
-      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play() }
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        await videoRef.current.play()
+      }
 
-      setPhase('calibrating')
-      startTimeRef.current = Date.now()
+      setPhaseBoth('calibrating')
+      runningRef.current = true
+      t0Ref.current = performance.now()
 
-      intervalRef.current = setInterval(() => {
+      const loop = () => {
+        if (!runningRef.current) return
+        rafRef.current = requestAnimationFrame(loop)
+
+        const now = performance.now()
+        const t = now - t0Ref.current
         const lum = sampleFrame(videoRef.current, canvasRef.current)
         if (lum === null) return
 
         setLux(lum)
-        luxHistRef.current = [...luxHistRef.current.slice(-49), lum]
-        setLuxHist([...luxHistRef.current])
 
-        // ── Calibration ──────────────────────────────────────────────────
-        if (calibRef.current.length < CALIB_SAMPLES) {
-          calibRef.current.push(lum)
-          setCalibPct(Math.round((calibRef.current.length / CALIB_SAMPLES) * 100))
+        // ── Calibration: measure ambient noise floor ─────────────────────
+        if (phaseRef.current === 'calibrating') {
+          calibSamplesRef.current.push({ t, lux: lum })
+          setCalibPct(Math.min(100, Math.round((t / CALIB_MS) * 100)))
+          if (t >= CALIB_MS) {
+            thresholdRef.current = calibrateThreshold(calibSamplesRef.current)
+            setPhaseBoth('listening')
+            t0Ref.current = performance.now()  // restart clock for listening
+          }
           return
         }
 
-        if (noiseLevelRef.current === 5 && calibRef.current.length >= CALIB_SAMPLES) {
-          // Compute noise = mean absolute delta between consecutive calib samples
-          let sumDelta = 0
-          for (let i = 1; i < calibRef.current.length; i++) {
-            sumDelta += Math.abs(calibRef.current[i] - calibRef.current[i - 1])
-          }
-          const meanDelta = sumDelta / (calibRef.current.length - 1)
-          // Threshold = 4× noise, minimum 8 lux
-          noiseLevelRef.current = Math.max(8, meanDelta * 4)
-          setDeltaThresh(Math.round(noiseLevelRef.current))
-          setPhase('listening')
-          startTimeRef.current = Date.now()
-        }
+        // ── Listening ─────────────────────────────────────────────────────
+        samplesRef.current.push({ t, lux: lum })
+        setElapsed(Math.floor(t / 1000))
 
-        // ── Listening ────────────────────────────────────────────────────
-        const prev = samplesRef.current[samplesRef.current.length - 1]
-        if (prev !== undefined) {
-          const delta = lum - prev
-          if (Math.abs(delta) > noiseLevelRef.current) setTransitions(t => t + 1)
-        }
+        // Periodic decode attempt + UI refresh
+        if (t - lastDecodeRef.current >= DECODE_EVERY) {
+          lastDecodeRef.current = t
 
-        samplesRef.current.push(lum)
+          const samples = samplesRef.current
+          const states = samplesToStates(samples, thresholdRef.current)
+          setStateHist(states.slice(-60))
+          let e = 0
+          for (let i = 1; i < states.length; i++) if (states[i] !== states[i - 1]) e++
+          setEdges(e)
 
-        const secs = (Date.now() - startTimeRef.current) / 1000
-        setElapsed(Math.floor(secs))
-
-        // Attempt decode every ~half bit period
-        if (samplesRef.current.length % Math.ceil(SAMPLES_PER_BIT / 2) === 0) {
-          const result = tryDecode(samplesRef.current, noiseLevelRef.current)
+          const result = decodeSamples(samples, thresholdRef.current)
           if (result !== null) {
-            setDecoded(result)
-            hardStop()
-            setPhase('done')
-            celebrate()
+            finish(result)
             return
           }
         }
 
-        if (secs >= WINDOW_SECONDS) { hardStop(); setPhase('done') }
-      }, SAMPLE_RATE_MS)
+        if (t >= WINDOW_MS) finish(null)
+      }
+      rafRef.current = requestAnimationFrame(loop)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
-      setPhase('idle')
+      setPhaseBoth('idle')
     }
-  }, [hardStop, tryDecode])
+  }, [finish])
 
   useEffect(() => () => hardStop(), [hardStop])
-
-  // Build display: show state machine output (more meaningful than raw lux)
-  const displayHistory = stateHist.length > 0 ? stateHist.slice(-50) : []
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col">
@@ -160,11 +158,10 @@ export default function ReceiverMode() {
           {phase === 'calibrating' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 gap-3">
               <p className="text-white text-sm font-mono text-center px-4">
-                Calibration…<br/>
-                <span className="text-slate-400 text-xs">Ne montre pas encore l'émetteur</span>
+                Calibration du bruit ambiant…
               </p>
               <div className="w-32 h-2 bg-slate-700 rounded-full overflow-hidden">
-                <div className="h-full bg-indigo-500 rounded-full transition-all" style={{ width: `${calibPct}%` }} />
+                <div className="h-full bg-indigo-500 rounded-full" style={{ width: `${calibPct}%` }} />
               </div>
             </div>
           )}
@@ -177,7 +174,7 @@ export default function ReceiverMode() {
                 <span className="text-white text-xs font-mono">REC {elapsed}s</span>
               </div>
               <div className="absolute bottom-2 right-2 text-indigo-300 text-xs font-mono">
-                Δ seuil={Math.round(deltaThresh)} · {transitions} transitions
+                {edges} fronts · lux {Math.round(lux)}
               </div>
             </div>
           )}
@@ -193,51 +190,26 @@ export default function ReceiverMode() {
 
       <div className="flex-1 flex flex-col items-center px-6 gap-4">
 
-        {/* State machine visualizer */}
+        {/* Detected ON/OFF signal */}
         {(phase === 'listening' || phase === 'done') && (
-          <div className="w-full max-w-sm space-y-2">
-            <div className="flex justify-between text-xs font-mono text-slate-400">
-              <span>Signal reconstruit (delta)</span>
-              <span>{Math.round(lux)}/255</span>
-            </div>
-
-            {/* Binary state bar — shows detected ON/OFF, not raw lux */}
+          <div className="w-full max-w-sm space-y-1">
+            <p className="text-slate-500 text-xs font-mono">Signal détecté (ON/OFF)</p>
             <div className="flex items-end gap-px h-8 bg-slate-900 rounded-lg px-1 py-1">
-              {displayHistory.map((on, i) => (
-                <div key={i} className={`flex-1 rounded-sm ${on ? 'bg-white' : 'bg-indigo-900'}`}
-                  style={{ height: on ? '100%' : '30%' }} />
-              ))}
-              {displayHistory.length === 0 && (
-                <span className="text-slate-700 text-xs font-mono m-auto">en attente de signal…</span>
+              {stateHist.length > 0 ? stateHist.map((on, i) => (
+                <div
+                  key={i}
+                  className={`flex-1 rounded-sm ${on ? 'bg-white' : 'bg-indigo-900'}`}
+                  style={{ height: on ? '100%' : '30%' }}
+                />
+              )) : (
+                <span className="text-slate-700 text-xs font-mono m-auto">en attente du signal…</span>
               )}
             </div>
-
-            {/* Raw lux sparkline below */}
-            <div className="flex items-end gap-px h-6 bg-slate-900/50 rounded px-1">
-              {luxHist.slice(-50).map((v, i) => (
-                <div key={i} className="flex-1 bg-slate-600 rounded-sm"
-                  style={{ height: `${Math.max(5, Math.round((v / 255) * 100))}%` }} />
-              ))}
-            </div>
-            <p className="text-slate-600 text-xs font-mono">lux brut (bas=normal, varie avec l'auto-expo)</p>
-
-            {phase === 'listening' && transitions < 4 && elapsed > 5 && (
+            {phase === 'listening' && edges < 4 && elapsed > 6 && (
               <p className="text-amber-400 text-xs font-mono">
-                ⚠ Seulement {transitions} transitions — montre l'écran de l'émetteur à la caméra.
+                ⚠ Aucun flash détecté — rapproche l'écran émetteur de la caméra.
               </p>
             )}
-          </div>
-        )}
-
-        {/* Bit stream */}
-        {rawBits.length > 0 && (
-          <div className="w-full max-w-sm">
-            <p className="text-slate-500 text-xs font-mono mb-1">{rawBits.length} bits reconstruits</p>
-            <div className="flex flex-wrap gap-0.5">
-              {rawBits.slice(-80).map((b, i) => (
-                <span key={i} className={`w-2.5 h-2.5 rounded-sm ${b ? 'bg-amber-400' : 'bg-slate-700'}`} />
-              ))}
-            </div>
           </div>
         )}
 
@@ -245,13 +217,18 @@ export default function ReceiverMode() {
         {decoded !== null && (
           <div className="w-full max-w-sm bg-green-950 border border-green-700 rounded-2xl p-5">
             <p className="text-green-400 text-xs font-mono mb-2 tracking-widest uppercase">✓ Message reçu</p>
-            <p className="text-white text-xl font-bold break-words">{decoded}</p>
+            <p className="text-white text-2xl font-bold break-words">{decoded}</p>
           </div>
         )}
         {phase === 'done' && decoded === null && (
-          <p className="text-amber-400 text-xs font-mono text-center max-w-sm">
-            Aucun message décodé. Recommence en rapprochant davantage les écrans.
-          </p>
+          <div className="w-full max-w-sm bg-amber-950/50 border border-amber-800 rounded-xl p-4">
+            <p className="text-amber-400 text-xs font-mono">
+              Décodage impossible ({edges} fronts capturés).
+              {edges < 10
+                ? " La caméra n'a pas vu les flashs : rapproche les appareils et réduis la lumière ambiante."
+                : ' Signal partiel : recommence en gardant les appareils immobiles pendant toute la transmission.'}
+            </p>
+          </div>
         )}
 
         {error && <p className="text-red-400 text-xs font-mono text-center max-w-sm">⚠ {error}</p>}
@@ -272,10 +249,10 @@ export default function ReceiverMode() {
         {phase === 'idle' && (
           <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-2">
             <p className="text-slate-400 text-xs font-mono uppercase tracking-widest mb-3">Mode opératoire</p>
-            <Step n={1} text='Start → caméra calibre 1.5s en fond neutre (pas de flash)' />
-            <Step n={2} text="Dès 100% : montre immédiatement l'écran émetteur à la caméra" />
-            <Step n={3} text="La barre blanche doit pulser au rythme des flashs de l'émetteur" />
-            <Step n={4} text="Message court recommandé : 2-4 caractères max (ex: VLC, HI)" />
+            <Step n={1} text='"Start Receiving" — 1,5s de calibration du bruit ambiant' />
+            <Step n={2} text="Placer l'écran de l'émetteur face à la caméra, à 10-20 cm" />
+            <Step n={3} text='Lancer "Transmettre" sur l&apos;émetteur et ne plus bouger' />
+            <Step n={4} text="Le message s'affiche automatiquement dès qu'il est complet" />
           </div>
         )}
       </div>
@@ -283,57 +260,21 @@ export default function ReceiverMode() {
   )
 }
 
-/**
- * Delta-based detector + run-length decoder.
- *
- * Instead of measuring absolute lux (which the camera's auto-exposure ruins),
- * we watch for sudden CHANGES (delta between consecutive samples).
- * A state machine tracks ON/OFF state: a positive spike → ON, negative → OFF.
- * This is immune to slow exposure drift — only fast transitions matter.
- */
-function deltaRLD(
-  samples: number[],
-  noiseLevel: number,
-  samplesPerBit: number,
-): { bits: boolean[]; states: boolean[] } {
-  const empty = { bits: [], states: [] }
-  if (samples.length < samplesPerBit * 3) return empty
-
-  // State machine: latch ON on rising delta, OFF on falling delta
-  const states: boolean[] = [false]
-  for (let i = 1; i < samples.length; i++) {
-    const delta = samples[i] - samples[i - 1]
-    if (delta > noiseLevel)       states.push(true)
-    else if (delta < -noiseLevel) states.push(false)
-    else                          states.push(states[states.length - 1])
-  }
-
-  // Run-length encode the state sequence
-  const runs: { v: boolean; n: number }[] = []
-  let cur = states[0], count = 1
-  for (let i = 1; i < states.length; i++) {
-    if (states[i] === cur) count++
-    else { runs.push({ v: cur, n: count }); cur = states[i]; count = 1 }
-  }
-  runs.push({ v: cur, n: count })
-
-  // Convert runs → bits
-  const bits: boolean[] = []
-  for (const run of runs) {
-    const nBits = Math.max(1, Math.round(run.n / samplesPerBit))
-    for (let i = 0; i < nBits; i++) bits.push(run.v)
-  }
-
-  return { bits, states }
-}
-
+/** Average luminosity of the central 60% of the frame (where the emitter screen is). */
 function sampleFrame(video: HTMLVideoElement | null, canvas: HTMLCanvasElement | null): number | null {
   if (!video || !canvas || video.readyState < 2) return null
-  const ctx = canvas.getContext('2d')
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
   if (!ctx) return null
-  const W = 64, H = 64
-  canvas.width = W; canvas.height = H
-  ctx.drawImage(video, 0, 0, W, H)
+  const vw = video.videoWidth, vh = video.videoHeight
+  if (!vw || !vh) return null
+
+  const W = 48, H = 48
+  canvas.width = W
+  canvas.height = H
+  // Center 60% crop — concentrates on the emitter screen, ignores borders
+  const cw = vw * 0.6, ch = vh * 0.6
+  ctx.drawImage(video, (vw - cw) / 2, (vh - ch) / 2, cw, ch, 0, 0, W, H)
+
   const data = ctx.getImageData(0, 0, W, H).data
   let sum = 0
   for (let i = 0; i < data.length; i += 4) {
@@ -343,7 +284,12 @@ function sampleFrame(video: HTMLVideoElement | null, canvas: HTMLCanvasElement |
 }
 
 function celebrate() {
-  confetti({ particleCount: 160, spread: 90, origin: { y: 0.6 }, colors: ['#6366f1', '#a5b4fc', '#818cf8', '#ffffff', '#fbbf24'] })
+  confetti({
+    particleCount: 160,
+    spread: 90,
+    origin: { y: 0.6 },
+    colors: ['#6366f1', '#a5b4fc', '#818cf8', '#ffffff', '#fbbf24'],
+  })
 }
 
 function Step({ n, text }: { n: number; text: string }) {
