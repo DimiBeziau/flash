@@ -1,8 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
-import { encodeMessage, totalBits } from '../lib/vlc-protocol'
+import { encodeMessage, totalBits, BIT_DURATION_MS } from '../lib/vlc-protocol'
 import { useTorch } from '../hooks/useTorch'
-
-const BIT_DURATION_MS = 120 // ~8 Hz — reliable on most devices
 
 export default function EmitterMode() {
   const [message, setMessage]     = useState('Hello VLC!')
